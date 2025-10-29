@@ -1,104 +1,257 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import db from './config/astraDb';
+import mongoose from 'mongoose';
+import { connectDatabase } from './config/database';
+import User, { IUser } from './models/User';
+import Product, { IProduct } from './models/Product';
 
+// Load environment variables
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors());
+// ===== MIDDLEWARE =====
+app.use(cors({
+  origin: ['http://localhost:5173', 'http://localhost:3000'],
+  credentials: true
+}));
+
 app.use(express.json());
 
-// Test connection route
-app.get('/api/test-connection', async (req, res) => {
+// Request logging
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
+// ===== ROUTES =====
+
+// Root
+app.get('/', (_req: Request, res: Response) => {
+  res.json({
+    message: 'StoreMari API is running',
+    version: '1.0.0',
+    database: 'MongoDB',
+    endpoints: {
+      test: '/api/test-connection',
+      signup: 'POST /api/auth/signup',
+      login: 'POST /api/auth/login',
+      products: 'GET /api/products',
+      productById: 'GET /api/products/:id',
+      createProduct: 'POST /api/products'
+    }
+  });
+});
+
+// Test database connection
+app.get('/api/test-connection', async (_req: Request, res: Response) => {
   try {
-    const collections = await db.listCollections();
-    res.json({ 
-      success: true, 
-      collections,
-      message: 'Connection successful!' 
+    if (!mongoose.connection.db) {
+      return res.status(500).json({
+        success: false,
+        error: 'Database not connected'
+      });
+    }
+
+    const collections = await mongoose.connection.db.listCollections().toArray();
+    const collectionNames = collections.map(c => c.name);
+    
+    // Count documents
+    const userCount = await User.countDocuments();
+    const productCount = await Product.countDocuments();
+    
+    res.json({
+      success: true,
+      message: 'Database connection successful!',
+      database: mongoose.connection.name,
+      collections: collectionNames,
+      stats: {
+        users: userCount,
+        products: productCount
+      }
     });
-  } catch (error: any) {
-    console.error('Connection error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
+  } catch (error) {
+    console.error('❌ Connection test error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error'
     });
   }
 });
 
-// User routes
-app.post('/api/auth/signup', async (req, res) => {
+// ===== AUTH ROUTES =====
+
+// Signup
+app.post('/api/auth/signup', async (req: Request, res: Response) => {
   try {
     const { name, email, password } = req.body;
-    const usersCollection = db.collection('users');
-    
+
+    // Validate
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
     // Check if user exists
-    const existingUser = await usersCollection.findOne({ email });
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
     if (existingUser) {
+      console.log(`⚠️  Signup failed: User exists - ${email}`);
       return res.status(400).json({ error: 'User already exists' });
     }
 
-    // Create user
-    const result = await usersCollection.insertOne({
+    // Create user (WARNING: Hash password in production!)
+    const user = new User({
       name,
-      email,
-      password, // In production, hash this!
-      createdAt: new Date()
+      email: email.toLowerCase(),
+      password
     });
 
-    res.json({ 
-      success: true, 
-      userId: result.insertedId,
-      user: { name, email }
+    await user.save();
+    console.log(`✅ User created: ${user.email} (ID: ${user._id})`);
+
+    res.status(201).json({
+      success: true,
+      userId: user._id,
+      user: {
+        name: user.name,
+        email: user.email
+      }
     });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    console.error('❌ Signup error:', error);
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Signup failed'
+    });
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+// Login
+app.post('/api/auth/login', async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
-    const usersCollection = db.collection('users');
-    
-    const user = await usersCollection.findOne({ email, password });
-    
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const user = await User.findOne({ 
+      email: email.toLowerCase(), 
+      password 
+    });
+
     if (!user) {
+      console.log(`⚠️  Login failed: ${email}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    res.json({ 
-      success: true, 
-      user: { 
-        name: user.name, 
-        email: user.email 
+    console.log(`✅ User logged in: ${user.email}`);
+
+    res.json({
+      success: true,
+      user: {
+        name: user.name,
+        email: user.email
       }
     });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    console.error('❌ Login error:', error);
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Login failed'
+    });
   }
 });
 
-// Products routes
-app.get('/api/products', async (req, res) => {
+// ===== PRODUCT ROUTES =====
+
+// Get products (all or by category)
+app.get('/api/products', async (req: Request, res: Response) => {
   try {
-    const category = req.query.category as string;
-    const productsCollection = db.collection('products');
+    const { category } = req.query;
+
+    let products: IProduct[];
     
-    const filter = category && category !== 'all' ? { category } : {};
-    const cursor = productsCollection.find(filter);
-    const products = await cursor.toArray();
-    
+    if (category && category !== 'all') {
+      products = await Product.find({ category: category as string });
+      console.log(`📦 Retrieved ${products.length} products (${category})`);
+    } else {
+      products = await Product.find();
+      console.log(`� Retrieved ${products.length} products (all)`);
+    }
+
     res.json(products);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    console.error('❌ Error fetching products:', error);
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to fetch products'
+    });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Backend server running on http://localhost:${PORT}`);
+// Get product by ID
+app.get('/api/products/:id', async (req: Request, res: Response) => {
+  try {
+    const product = await Product.findById(req.params.id);
+
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    res.json(product);
+  } catch (error) {
+    console.error('❌ Error fetching product:', error);
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to fetch product'
+    });
+  }
 });
+
+// Create product
+app.post('/api/products', async (req: Request, res: Response) => {
+  try {
+    const product = new Product(req.body);
+    await product.save();
+
+    console.log(`✅ Product created: ${product.name} (ID: ${product._id})`);
+
+    res.status(201).json({
+      success: true,
+      productId: product._id,
+      product
+    });
+  } catch (error) {
+    console.error('❌ Error creating product:', error);
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to create product'
+    });
+  }
+});
+
+// ===== START SERVER =====
+const startServer = async () => {
+  try {
+    // Connect to database
+    await connectDatabase();
+
+    // Start listening
+    app.listen(PORT, () => {
+      console.log('\n🚀 SERVER STARTED');
+      console.log('━'.repeat(50));
+      console.log(`📍 URL: http://localhost:${PORT}`);
+      console.log(`🌐 CORS: http://localhost:5173`);
+      console.log(`⏰ Time: ${new Date().toLocaleString()}`);
+      console.log('━'.repeat(50));
+      console.log('\n✨ Press Ctrl+C to stop\n');
+    });
+  } catch (error) {
+    console.error('\n❌ STARTUP FAILED');
+    console.error(error instanceof Error ? error.message : 'Unknown error');
+    process.exit(1);
+  }
+};
+
+startServer();
